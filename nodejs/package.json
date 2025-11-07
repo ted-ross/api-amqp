@@ -1,6 +1,7 @@
 {
   "name": "api-amqp",
   "version": "1.0.0",
+  "type": "module",
   "description": "Libraries for APIs running over the AMQP protocol",
   "main": "api-amqp.js",
   "scripts": {
