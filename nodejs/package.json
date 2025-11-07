@@ -1,0 +1,26 @@
+{
+  "name": "api-amqp",
+  "version": "1.0.0",
+  "description": "Libraries for APIs running over the AMQP protocol",
+  "main": "api-amqp.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ted-ross/api-amqp.git"
+  },
+  "keywords": [
+    "API",
+    "AMQP"
+  ],
+  "author": "T. Ross",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/ted-ross/api-amqp/issues"
+  },
+  "homepage": "https://github.com/ted-ross/api-amqp#readme",
+  "dependencies": {
+    "rhea": "^3.0.4"
+  }
+}
