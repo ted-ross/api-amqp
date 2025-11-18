@@ -23,18 +23,18 @@ import rhea from "rhea";
 
 export class APIConnection {
     constructor(host='localhost', port='5672', transport=undefined, ca=undefined, cert=undefined, key=undefined) {
-        rhea.options.enable_sasl_external = true;
-        rhea.on('connection_open', this._on_connection_open);
-        rhea.on('receiver_open',   this._on_receiver_open);
-        rhea.on('sendable',        this._on_sendable);
-        rhea.on('message',         this._on_message);
-        rhea.on('accepted',        this._on_accepted);
-        rhea.on('rejected',        this._on_rejected);
-        rhea.on('released',        this._on_released);
-        rhea.on('modified',        this._on_modified);
-        rhea.on('settled',         this._on_settled);
+        this.container = rhea.create_container({enable_sasl_external: true});
+        this.container.on('connection_open', this._on_connection_open);
+        this.container.on('receiver_open',   this._on_receiver_open);
+        this.container.on('sendable',        this._on_sendable);
+        this.container.on('message',         this._on_message);
+        this.container.on('accepted',        this._on_accepted);
+        this.container.on('rejected',        this._on_rejected);
+        this.container.on('released',        this._on_released);
+        this.container.on('modified',        this._on_modified);
+        this.container.on('settled',         this._on_settled);
 
-        this.amqpConnection = rhea.connect({
+        this.amqpConnection = this.container.connect({
             host      : host,
             hostname  : host,
             transport : transport,
@@ -60,71 +60,138 @@ export class APIConnection {
         if (!this.endpoints[address]) {
             let e = new Endpoint(this, address);
             this.endpoints[address] = e;
-            this.receivers.push(this.amqpConnection.open_receiver({source: address, autoaccept: false, autosettle: false}));
+            let receiver = this.amqpConnection.open_receiver({
+                source: address,
+                autoaccept: false,
+                autosettle: false,
+                rcv_settle_mode: 1,
+            });
+            receiver.__endpoint = e;
+            this.receivers.push(receiver);
             return e;
         } else {
             throw new Error(`More than one endpoint on address ${address}`);
         }
     }
 
+    async fetch(address, path, op='GET', body=undefined) {
+        this.anonSender.send({
+            to       : address,
+            reply_to : this.replyTo,
+            application_properties : {
+                op   : op,
+                path : path,
+            },
+            body : body,
+        });
+    }
+
     _on_connection_open(event) {}
     _on_receiver_open(event) {}
     _on_sendable(event) {}
-    _on_message(event) {}
-    _on_accepted(event) {}
-    _on_rejected(event) {}
+    async _on_message(event) {
+        if (event.receiver.__endpoint) {
+            await event.receiver.__endpoint._dispatch(event);
+        }
+    }
+    _on_accepted(event) {
+        console.log("Accepted");
+    }
+    _on_rejected(event) {
+        console.log("Rejected");
+    }
     _on_released(event) {}
     _on_modified(event) {}
-    _on_settled(event) {}
+    _on_settled(event) {
+        console.log("Settled");
+    }
 }
 
 export class Endpoint {
     constructor(connection, address) {
         this.connection = connection;
         this.address    = address;
-        this.path_tree  = new Node();
-    }
-
-    close() {
-        this.connection.close();
+        this.path_tree  = new Path();
     }
 
     route(path) {
-        let p = new Path(this, path);
+        let n = new Node(this, path);
         const elements = path.split('/');
-        this.path_tree.insert(p, elements);
-        return p;
+        this.path_tree.insert(n, elements);
+        return n;
     }
 
-    async _dispatch(delivery, message) {}
+    _find_path(tree, elements) {
+        if (elements.length == 0) {
+            return tree;
+        }
+
+        const first = elements.pop();
+        if (first == '') {
+            // Ignore blank elements
+            return this._find_path(tree, elements);
+        }
+
+        const child = tree.get_child(first);
+        return this._find_path(child, elements);
+    }
+
+    async _dispatch(event) {
+        const pathtext = event.message.application_properties.path;
+        console.log(`Endpoint dispatch for path: ${pathtext}`);
+        if (pathtext) {
+            const elements = pathtext.split('/');
+            const path     = this._find_path(this.path_tree, elements);
+
+            if (path) {
+                try {
+                    await path.get_node()._dispatch(event);
+                    return;
+                } catch (err) {
+                    console.log(`Exception in endpoint message dispatch: ${err.stack}`);
+                }
+            }
+        }
+
+        event.delivery.reject();
+        event.delivery.settled = true;
+    }
 }
 
-class Node {
+class Path {
     constructor() {
-        this.path     = undefined;
+        this.node     = undefined;
         this.children = {};
     }
 
-    insert(path, elements) {
+    insert(node, elements) {
         if (elements.length == 0) {
             // End of the line, insert here
-            this.path = path;
+            this.node = node;
         } else {
             let element = elements.pop();
             if (element == '') {
                 // Ignore blank elements
-                this.insert(path, elements);
+                this.insert(node, elements);
             } else {
                 if (!this.children[element]) {
-                    this.children[element] = new Node();
+                    this.children[element] = new Path();
                 }
-                this.children[element].insert(path, elements);
+                this.children[element].insert(node, elements);
             }
         }
     }
+
+    get_child(name) {
+        return this.children[name];
+    }
+
+    get_node() {
+        return this.node;
+    }
 }
 
-export class Path {
+export class Node {
     constructor(endpoint, path) {
         this.endpoint = endpoint;
         this.path = path;
@@ -134,6 +201,7 @@ export class Path {
             put    : [],
             post   : [],
             delete : [],
+            watch  : [],
         };
         this.mutex = undefined;
     }
@@ -158,54 +226,68 @@ export class Path {
         return this;
     }
 
-    mutex(m) {
+    mutex() {
         if (!this.mutex) {
-            this.mutex = m;
-        } else {
-            throw new Error('more than one Mutex inserted in the same path node');
+            this.mutex = new Mutex(this);
         }
-        return this;
+        return this.mutex;
     }
 
-    async _dispatch(delivery, message) {
+    async _dispatch(event) {
+        const opcode = event.message.application_properties.op.toLowerCase();
+        console.log(`Node at path '${this.path}' dispatched with opcode: ${opcode}`);
+
+        if (opcode == 'acquire') {
+            await this.mutex._dispatch(event);
+        } else {
+            for (const handler of this.handlers[opcode]) {
+                handler({}, {}); // Use the 'next' argument
+            }
+        }
+        event.delivery.accept();
+        event.delivery.settled = true;
     }
 }
 
 export class Mutex {
-    constructor() {
-        this.locks = {}; // name => Lock
+    constructor(path) {
+        this.path      = path;
+        this.instances = {}; // name => Named mutex instance
     }
 
     queryAll() {
         let list = [];
-        for (const key of Object.keys(this.locks)) {
+        for (const key of Object.keys(this.instances)) {
             list.push(key);
         }
         return list;
     }
 
     query(name) {
-        if (this.locks[name]) {
-            return this.locks[name].query();
+        if (this.instances[name]) {
+            return this.instances[name].query();
         }
         return undefined;
     }
 
-    _dispatch(delivery, message) {
+    async _dispatch(delivery, message) {
         const ap = message.application_properties;
-        const lockName = ap.name;
-        if (!this.locks[lockName]) {
-            this.locks[lockName] = new Lock();
+        const mutexName = ap.name;
+        if (!this.instances[mutexName]) {
+            this.instances[mutexName] = new MutexInstance();
         }
-        this.locks[lockName]._dispatch(delivery, message);
+        await this.instances[mutexName]._dispatch(delivery, message);
     }
 }
 
-class Lock {
+class MutexInstance {
     constructor() {
         this.queue = []; // {delivery, message}
     }
 
+    //
+    // Return a list of acquire requests for this named mutex.  The first item is the acquired one.
+    //
     query() {
         let list = [];
         for (const request of this.queue) {
@@ -222,7 +304,7 @@ class Lock {
             timer    : (this.queue.length > 0 && ap.wait_time) ? setTimeout(() => {
                 delivery.reject();
                 delivery.settle();
-                this._remove_head();
+                this._remove_head();  // doesn't look right
             }, ap.wait_time) : undefined,
         }
         this.queue.push(request);
