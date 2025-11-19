@@ -114,7 +114,7 @@ export class APIConnection {
                 for (const client of Object.values(this.client_endpoints)) {
                     client._on_sendable();
                 }
-                console.log(`reply-to: ${this.reply_to}`);
+                //console.log(`reply-to: ${this.reply_to}`);
             }
         });
         this.container.on('sendable', async (context) => {
@@ -413,15 +413,29 @@ export class Node {
     }
 
     async _dispatch(context) {
+        let   handled = false;
         const opcode = context.message.application_properties.op.toLowerCase();
 
         if (opcode == 'acquire') {
             await this.mutex._dispatch(context);
+            handled = true;
         } else {
             for (const handler of this.handlers[opcode]) {
                 handler(context.message, new Response(context.message, this.endpoint.connection.anonSender)); // Use the 'next' argument
+                handled = true;
             }
         }
+
+        if (!handled) {
+            const response = {
+                to                     : context.message.reply_to,
+                correlation_id         : context.message.correlation_id,
+                application_properties : { status: 400, statusDescription: 'Not Permitted' },
+                body                   : 'Method not permitted for this resource',
+            };
+            this.endpoint.connection.anonSender.send(response);
+        }
+
         context.delivery.accept();
         context.delivery.settled = true;
     }

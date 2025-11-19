@@ -58,7 +58,8 @@ async function TestClient() {
     result = await endpoint.fetch('/names/sub1', {timeout: 2});
     console.log(`Status: ${result.status()}, Body: `, result.obj());
 
-    setTimeout(() => { process.exit(0); }, 5000);
+    result = await endpoint.fetch('/names/sub1/sub2', {op: 'PUT', timeout: 2, body: 'Another Sub2'});
+    console.log(`Status: ${result.status()}, Body: `, result.obj());
 }
 
 class CountClient {
@@ -80,33 +81,38 @@ class CountClient {
     }
 }
 
-async function LockTest() {
-    const client_connection = new APIConnection();
-    const endpoint = client_connection.client_endpoint('/lock_test/v1alpha1');
-    let workers  = [];
-    let promises = [];
-    const count = 100;
-    for (let i = 0; i < count; i++) {
-        workers.push(new CountClient(endpoint));
-    }
+function LockTest() {
+    return new Promise((resolve, reject) => {
+        const client_connection = new APIConnection();
+        const endpoint = client_connection.client_endpoint('/lock_test/v1alpha1');
+        let workers  = [];
+        let promises = [];
+        const count = 100;
+        for (let i = 0; i < count; i++) {
+            workers.push(new CountClient(endpoint));
+        }
 
-    //
-    // Run all of the increment sequences concurrently and gather the promises.
-    //
-    for (let i = 0; i < count; i++) {
-        promises.push(workers[i].safe_increment());
-    }
+        //
+        // Run all of the increment sequences concurrently and gather the promises.
+        //
+        for (let i = 0; i < count; i++) {
+            promises.push(workers[i].safe_increment());
+        }
 
-    //
-    // Wait for all of the gathered promises to resolve, then check the final total.
-    //
-    Promise.all(promises).then(async () => {
-        const result = await endpoint.fetch('/variables/counter');
-        const final = result.obj();
-        console.log(`Final count: ${final} - ${(final != count) ? `FAIL (expected ${count})` : 'PASS'}`);
-    })
+        //
+        // Wait for all of the gathered promises to resolve, then check the final total.
+        //
+        Promise.all(promises).then(async () => {
+            const result = await endpoint.fetch('/variables/counter');
+            const final = result.obj();
+            console.log(`Final count: ${final} - ${(final != count) ? `FAIL (expected ${count})` : 'PASS'}`);
+        })
+        .then(() => { resolve(); });
+    });
 }
 
 await TestServer();
 await TestClient();
 await LockTest();
+
+process.exit(0);
