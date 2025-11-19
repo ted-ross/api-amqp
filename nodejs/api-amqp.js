@@ -21,19 +21,28 @@
 
 import rhea from "rhea";
 
-export class APIConnection {
-    constructor(host='localhost', port='5672', transport=undefined, ca=undefined, cert=undefined, key=undefined) {
-        this.container = rhea.create_container({enable_sasl_external: true});
-        this.container.on('connection_open', this._on_connection_open);
-        this.container.on('receiver_open',   this._on_receiver_open);
-        this.container.on('sendable',        this._on_sendable);
-        this.container.on('message',         this._on_message);
-        this.container.on('accepted',        this._on_accepted);
-        this.container.on('rejected',        this._on_rejected);
-        this.container.on('released',        this._on_released);
-        this.container.on('modified',        this._on_modified);
-        this.container.on('settled',         this._on_settled);
+const DEFAULT_TIMEOUT_SECONDS = 10;
 
+export class APIConnection {
+    constructor(host='localhost', port='5672', transport='tcp', ca=undefined, cert=undefined, key=undefined) {
+        //
+        // Create an AMQP container dedicated to this API connection
+        //
+        this.container = rhea.create_container({enable_sasl_external: true});
+        this._setup_handlers();
+
+        //
+        // Initialize internal state
+        //
+        this.reply_to = undefined;
+        this.server_endpoints = {};
+        this.client_endpoints = {};
+        this.in_flight        = {};
+        this.next_cid         = 1;
+
+        //
+        // Open the AMQP connection to the network
+        //
         this.amqpConnection = this.container.connect({
             host      : host,
             hostname  : host,
@@ -43,75 +52,203 @@ export class APIConnection {
             key       : key,
             cert      : cert,
         });
-        this.senders   = []
-        this.receivers = []
-        this.replyTo = undefined;
+
+        //
+        // Set up a receiver with a dynamic address on which to receive replies
+        //
         this.replyReceiver = this.amqpConnection.open_receiver({source:{dynamic:true}});
-        this.anonSender    = this.amqpConnection.open_sender();
-        this.amqpConnection._apiConn = this;
-        this.endpoints = {};
+
+        //
+        // Set up an anonymous sender over which to send addressed messages
+        //
+        this.anonSender = this.amqpConnection.open_sender();
     }
 
     close() {
         this.amqpConnection.close();
     }
 
-    endpoint(address) {
-        if (!this.endpoints[address]) {
-            let e = new Endpoint(this, address);
-            this.endpoints[address] = e;
-            let receiver = this.amqpConnection.open_receiver({
-                source: address,
-                autoaccept: false,
-                autosettle: false,
-                rcv_settle_mode: 1,
-            });
-            receiver.__endpoint = e;
-            this.receivers.push(receiver);
+    //
+    // Server Side - Establish an endpoint for receiving API requests
+    //
+    server_endpoint(address) {
+        if (!this.server_endpoints[address]) {
+            let e = new ServerEndpoint(this, address);
+            this.server_endpoints[address] = e;
             return e;
         } else {
-            throw new Error(`More than one endpoint on address ${address}`);
+            throw new Error(`Already a server endpoint on address ${address}`);
         }
     }
 
-    async fetch(address, path, op='GET', body=undefined) {
-        this.anonSender.send({
-            to       : address,
-            reply_to : this.replyTo,
-            application_properties : {
-                op   : op,
-                path : path,
-            },
-            body : body,
+    //
+    // Client Side - Establish a portal to a server endpoint.  This will use an addressed sender link
+    // and will provide flow control back pressure to the application.
+    //
+    client_endpoint(address) {
+        if (!this.client_endpoints[address]) {
+            let e = new ClientEndpoint(this, address);
+            this.client_endpoints[address] = e;
+            return e;
+        } else {
+            throw new Error(`Already a client endpoint on address ${address}`);
+        }
+    }
+
+    _new_cid(dispatch_object) {
+        const cid = this.next_cid;
+        this.next_cid += 1;
+        this.in_flight[cid] = dispatch_object;
+        return cid;
+    }
+
+    _cancel_cid(cid) {
+        delete this.in_flight[cid];
+    }
+
+    _setup_handlers() {
+        this.container.on('connection_open', (context) => {});
+        this.container.on('receiver_open', async (context) => {
+            if (context.receiver == this.replyReceiver) {
+                this.reply_to = context.receiver.source.address;
+                for (const client of Object.values(this.client_endpoints)) {
+                    client._on_sendable();
+                }
+                console.log(`reply-to: ${this.reply_to}`);
+            }
         });
-    }
-
-    _on_connection_open(event) {}
-    _on_receiver_open(event) {}
-    _on_sendable(event) {}
-    async _on_message(event) {
-        if (event.receiver.__endpoint) {
-            await event.receiver.__endpoint._dispatch(event);
-        }
-    }
-    _on_accepted(event) {
-        console.log("Accepted");
-    }
-    _on_rejected(event) {
-        console.log("Rejected");
-    }
-    _on_released(event) {}
-    _on_modified(event) {}
-    _on_settled(event) {
-        console.log("Settled");
+        this.container.on('sendable', async (context) => {
+            if (context.sender.__endpoint) {
+                context.sender.__endpoint._on_sendable();
+            }
+        });
+        this.container.on('message', async (context) => {
+            try {
+                if (context.receiver == this.replyReceiver) {
+                    const cid         = context.message.correlation_id;
+                    const destination = this.in_flight[cid];
+                    if (destination) {
+                        await destination._dispatch(context);
+                    } else {
+                        throw new Error(`Reply message for unknown correlation_id ${cid}`);
+                    }
+                }
+                else if (context.receiver.__endpoint) {
+                    await context.receiver.__endpoint._dispatch(context);
+                } else {
+                    throw new Error(`Message received for which there is no registered endpoint`);
+                }
+            } catch (err) {
+                console.log(`Exception in API message dispatch: ${err.stack}`);
+                context.delivery.reject();
+                context.delivery.settled = true;
+            }
+        });
+        //this.container.on('accepted', async (context) => { console.log('Accepted'); });
+        //this.container.on('rejected', async (context) => { console.log('Rejected'); });
+        //this.container.on('released', async (context) => { console.log('Released'); });
+        //this.container.on('modified', async (context) => { console.log('Modified'); });
+        //this.container.on('settled', async (context) => { console.log('Settled'); });
     }
 }
 
-export class Endpoint {
+export class FetchResult {
+    constructor(message) {
+        this.message = message;
+    }
+
+    status() {
+        return this.message.application_properties.status;
+    }
+
+    obj() {
+        return this.message.body;
+    }
+}
+
+export class ClientEndpoint {
+    constructor(connection, address) {
+        this.connection = connection;
+        this.address    = address;
+        this.outgoing   = [];
+        this.in_flight  = {};
+        this.sender     = connection.amqpConnection.open_sender({
+            target : address,
+        });
+        this.sender.__endpoint = this;
+    }
+
+    fetch(path, args={}) {
+        return new Promise((resolve, reject) => {
+            let config = {
+                op      : 'GET',
+                timeout : DEFAULT_TIMEOUT_SECONDS,
+            }
+            for (const [key, val] of Object.entries(args)) {
+                config[key] = val;
+            }
+
+            const timer = setTimeout(() => {
+                reject(new Error('Operation timed out without a response from the server'));
+            }, config.timeout * 1000);
+
+            const cid = this.connection._new_cid(this);
+            this.in_flight[cid] = (context) => {
+                clearTimeout(timer);
+                resolve(new FetchResult(context.message));
+            };
+            let request = {
+                correlation_id : cid,
+                application_properties : {
+                    op   : config.op,
+                    path : path,
+                },
+                body : config.body,
+            };
+            this.outgoing.push(request);
+            this._on_sendable()
+        });
+    }
+
+    async acquire(path, args={}) {
+
+    }
+
+    async _dispatch(context) {
+        const cid     = context.message.correlation_id;
+        const handler = this.in_flight[cid];
+        if (handler) {
+            delete this.in_flight[cid];
+            this.connection._cancel_cid(cid);
+            handler(context);
+        }
+    }
+
+    _on_sendable() {
+        if (!this.connection.reply_to) {
+            return;
+        }
+
+        while (this.sender.credit > 0 && this.outgoing.length > 0) {
+            const message = this.outgoing.pop();
+            message.reply_to = this.connection.reply_to;
+            this.sender.send(message);
+        }
+    }
+}
+
+export class ServerEndpoint {
     constructor(connection, address) {
         this.connection = connection;
         this.address    = address;
         this.path_tree  = new Path();
+        this.receiver = this.connection.amqpConnection.open_receiver({
+            source: address,
+            autoaccept: false,  // We will explicitly handle delivery disposition
+            autosettle: false,  // We will explicitly handle delivery settlement
+            rcv_settle_mode: 1, // Don't automatically settle when terminal disposition is set on a delivery
+        });
+        this.receiver.__endpoint = this;
     }
 
     route(path) {
@@ -133,28 +270,70 @@ export class Endpoint {
         }
 
         const child = tree.get_child(first);
-        return this._find_path(child, elements);
+        return child ? this._find_path(child, elements) : child;
     }
 
-    async _dispatch(event) {
-        const pathtext = event.message.application_properties.path;
-        console.log(`Endpoint dispatch for path: ${pathtext}`);
+    async _dispatch(context) {
+        const pathtext = context.message.application_properties.path;
         if (pathtext) {
             const elements = pathtext.split('/');
             const path     = this._find_path(this.path_tree, elements);
 
             if (path) {
-                try {
-                    await path.get_node()._dispatch(event);
-                    return;
-                } catch (err) {
-                    console.log(`Exception in endpoint message dispatch: ${err.stack}`);
-                }
+                await path.get_node()._dispatch(context);
+                return;
             }
         }
 
-        event.delivery.reject();
-        event.delivery.settled = true;
+        const error_response = {
+            to             : context.message.reply_to,
+            correlation_id : context.message.correlation_id,
+            application_properties : {
+                status            : '404',
+                statusDescription : 'Not Found',
+            },
+            body : "No resource found at path",
+        };
+
+        this.connection.anonSender.send(error_response);
+
+        context.delivery.accept();
+        context.delivery.settled = true;
+    }
+}
+
+export class Response {
+    constructor(request_message, sender) {
+        this.request_message = request_message;
+        this.sender          = sender;
+        this.sent            = false;
+        this.response_message = {
+            to                     : request_message.reply_to,
+            correlation_id         : request_message.correlation_id,
+            application_properties : {},
+            body                   : undefined,
+        }
+    }
+
+    status(code) {
+        if (this.sent) {
+            throw new Error("Setting status on an already sent response");
+        }
+        this.response_message.application_properties.status = code;
+        return this;
+    }
+
+    end() {
+        this.send(undefined);
+    }
+
+    send(body) {
+        if (this.sent) {
+            throw new Error("Sending on an already sent response");
+        }
+        this.response_message.body = body;
+        this.sender.send(this.response_message);
+        this.sent = true;
     }
 }
 
@@ -203,7 +382,7 @@ export class Node {
             delete : [],
             watch  : [],
         };
-        this.mutex = undefined;
+        this._mutex = undefined;
     }
 
     get(handler) {
@@ -227,25 +406,24 @@ export class Node {
     }
 
     mutex() {
-        if (!this.mutex) {
-            this.mutex = new Mutex(this);
+        if (!this._mutex) {
+            this._mutex = new Mutex(this);
         }
-        return this.mutex;
+        return this._mutex;
     }
 
-    async _dispatch(event) {
-        const opcode = event.message.application_properties.op.toLowerCase();
-        console.log(`Node at path '${this.path}' dispatched with opcode: ${opcode}`);
+    async _dispatch(context) {
+        const opcode = context.message.application_properties.op.toLowerCase();
 
         if (opcode == 'acquire') {
-            await this.mutex._dispatch(event);
+            await this.mutex._dispatch(context);
         } else {
             for (const handler of this.handlers[opcode]) {
-                handler({}, {}); // Use the 'next' argument
+                handler(context.message, new Response(context.message, this.endpoint.connection.anonSender)); // Use the 'next' argument
             }
         }
-        event.delivery.accept();
-        event.delivery.settled = true;
+        context.delivery.accept();
+        context.delivery.settled = true;
     }
 }
 

@@ -23,21 +23,90 @@ import { APIConnection } from "./api-amqp.js";
 
 async function TestServer() {
     const server_connection = new APIConnection();
-    const endpoint = server_connection.endpoint('test_endpoint/v1alpha1');
+    const endpoint = server_connection.server_endpoint('/test_endpoint/v1alpha1');
     endpoint.route('/names')
     .get((req, res) => {
-        res.status(200).body({item1: 'first', item2: 'second'});
+        res.status(200).send({item1: 'first', item2: 'second'});
     });
     endpoint.route('/names/sub1/sub2')
     .get((req, res) => {
-        res.status(200).body("Sub2");
+        res.status(200).send("Sub2");
+    });
+
+    var   counter = 0;
+    const lock_text_endpoint = server_connection.server_endpoint('/lock_test/v1alpha1');
+    lock_text_endpoint.route('/variables/counter')
+    .get((req, res) => {
+        res.status(200).send(counter);
     })
+    .put((req, res) => {
+        counter = req.body;
+        res.status(200).send(counter);
+    });
+    let mutex = lock_text_endpoint.route('/locks').mutex();
 }
 
 async function TestClient() {
     const client_connection = new APIConnection();
-    let result = await client_connection.fetch('test_endpoint/v1alpha1', '/names');
+    const endpoint = client_connection.client_endpoint('/test_endpoint/v1alpha1')
+    let result = await endpoint.fetch('/names', {timeout: 1});
+    console.log(`Status: ${result.status()}, Body: `, result.obj());
+
+    result = await endpoint.fetch('/names/sub1/sub2');
+    console.log(`Status: ${result.status()}, Body: `, result.obj());
+
+    result = await endpoint.fetch('/names/sub1', {timeout: 2});
+    console.log(`Status: ${result.status()}, Body: `, result.obj());
+
+    setTimeout(() => { process.exit(0); }, 5000);
+}
+
+class CountClient {
+    constructor(endpoint) {
+        this.endpoint = endpoint;
+    }
+
+    async increment() {
+        let result = await this.endpoint.fetch('/variables/counter');
+        let value = result.obj();
+        value += 1;
+        result = await this.endpoint.fetch('/variables/counter', {op: 'PUT', body: value});
+    }
+
+    async safe_increment() {
+        // TODO - Acquire Mutex
+        await this.increment();
+        // TODO - Release Mutex
+    }
+}
+
+async function LockTest() {
+    const client_connection = new APIConnection();
+    const endpoint = client_connection.client_endpoint('/lock_test/v1alpha1');
+    let workers  = [];
+    let promises = [];
+    const count = 100;
+    for (let i = 0; i < count; i++) {
+        workers.push(new CountClient(endpoint));
+    }
+
+    //
+    // Run all of the increment sequences concurrently and gather the promises.
+    //
+    for (let i = 0; i < count; i++) {
+        promises.push(workers[i].safe_increment());
+    }
+
+    //
+    // Wait for all of the gathered promises to resolve, then check the final total.
+    //
+    Promise.all(promises).then(async () => {
+        const result = await endpoint.fetch('/variables/counter');
+        const final = result.obj();
+        console.log(`Final count: ${final} - ${(final != count) ? `FAIL (expected ${count})` : 'PASS'}`);
+    })
 }
 
 await TestServer();
 await TestClient();
+await LockTest();
