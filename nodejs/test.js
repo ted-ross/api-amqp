@@ -34,8 +34,8 @@ async function TestServer() {
     });
 
     var   counter = 0;
-    const lock_text_endpoint = server_connection.server_endpoint('/lock_test/v1alpha1');
-    lock_text_endpoint.route('/variables/counter')
+    const lock_test_endpoint = server_connection.server_endpoint('/lock_test/v1alpha1');
+    lock_test_endpoint.route('/variables/counter')
     .get((req, res) => {
         res.status(200).send(counter);
     })
@@ -43,22 +43,22 @@ async function TestServer() {
         counter = req.body;
         res.status(200).send(counter);
     });
-    let mutex = lock_text_endpoint.route('/locks').mutex();
+    let mutex = lock_test_endpoint.route('/locks').mutex();
 }
 
 async function TestClient() {
     const client_connection = new APIConnection();
     const endpoint = client_connection.client_endpoint('/test_endpoint/v1alpha1')
-    let result = await endpoint.fetch('/names', {timeout: 1});
+    let result = await endpoint.fetch('/names', {timeout: 1000});
     console.log(`Status: ${result.status()}, Body: `, result.obj());
 
     result = await endpoint.fetch('/names/sub1/sub2');
     console.log(`Status: ${result.status()}, Body: `, result.obj());
 
-    result = await endpoint.fetch('/names/sub1', {timeout: 2});
+    result = await endpoint.fetch('/names/sub1', {timeout: 2000});
     console.log(`Status: ${result.status()}, Body: `, result.obj());
 
-    result = await endpoint.fetch('/names/sub1/sub2', {op: 'PUT', timeout: 2, body: 'Another Sub2'});
+    result = await endpoint.fetch('/names/sub1/sub2', {op: 'PUT', timeout: 2000, body: 'Another Sub2'});
     console.log(`Status: ${result.status()}, Body: `, result.obj());
 }
 
@@ -72,47 +72,54 @@ class CountClient {
         let value = result.obj();
         value += 1;
         result = await this.endpoint.fetch('/variables/counter', {op: 'PUT', body: value});
+        return value;
     }
 
     async safe_increment() {
-        // TODO - Acquire Mutex
-        await this.increment();
-        // TODO - Release Mutex
+        return await this.endpoint.critical_section(
+            '/locks',
+            'counter',
+            async (acquisition_id) => {
+                return await this.increment();
+            },
+            () => {},
+            {
+                label      : 'safe_increment',
+                timeout    : 10000,
+            }
+        );
     }
 }
 
-function LockTest() {
-    return new Promise((resolve, reject) => {
-        const client_connection = new APIConnection();
-        const endpoint = client_connection.client_endpoint('/lock_test/v1alpha1');
-        let workers  = [];
-        let promises = [];
-        const count = 100;
-        for (let i = 0; i < count; i++) {
-            workers.push(new CountClient(endpoint));
-        }
+async function LockTest() {
+    const client_connection = new APIConnection();
+    const endpoint = client_connection.client_endpoint('/lock_test/v1alpha1');
+    let workers  = [];
+    let promises = [];
+    const count = 250;
+    for (let i = 0; i < count; i++) {
+        workers.push(new CountClient(endpoint));
+    }
 
-        //
-        // Run all of the increment sequences concurrently and gather the promises.
-        //
-        for (let i = 0; i < count; i++) {
-            promises.push(workers[i].safe_increment());
-        }
+    //
+    // Run all of the increment sequences concurrently and gather the promises.
+    //
+    for (let i = 0; i < count; i++) {
+        promises.push(workers[i].safe_increment());
+    }
 
-        //
-        // Wait for all of the gathered promises to resolve, then check the final total.
-        //
-        Promise.all(promises).then(async () => {
-            const result = await endpoint.fetch('/variables/counter');
-            const final = result.obj();
-            console.log(`Final count: ${final} - ${(final != count) ? `FAIL (expected ${count})` : 'PASS'}`);
-        })
-        .then(() => { resolve(); });
-    });
+    //
+    // Wait for all of the gathered promises to resolve, then check the final total.
+    //
+    const values = await Promise.all(promises);
+    const result = await endpoint.fetch('/variables/counter');
+    const final = result.obj();
+    console.log(`Final count: ${final} - ${(final != count) ? `FAIL (expected ${count})` : 'PASS'}`);
+    console.log(values);
 }
 
 await TestServer();
 await TestClient();
 await LockTest();
 
-process.exit(0);
+setTimeout(() => { process.exit(0)}, 10000);

@@ -21,7 +21,12 @@
 
 import rhea from "rhea";
 
-const DEFAULT_TIMEOUT_SECONDS = 10;
+const DEFAULT_TIMEOUT_MSEC = 10000;
+
+const STATE_ACCEPTED = 1;
+const STATE_REJECTED = 2;
+const STATE_RELEASED = 3;
+const STATE_MODIFIED = 4;
 
 export class APIConnection {
     constructor(host='localhost', port='5672', transport='tcp', ca=undefined, cert=undefined, key=undefined) {
@@ -144,11 +149,36 @@ export class APIConnection {
                 context.delivery.settled = true;
             }
         });
-        //this.container.on('accepted', async (context) => { console.log('Accepted'); });
-        //this.container.on('rejected', async (context) => { console.log('Rejected'); });
-        //this.container.on('released', async (context) => { console.log('Released'); });
-        //this.container.on('modified', async (context) => { console.log('Modified'); });
-        //this.container.on('settled', async (context) => { console.log('Settled'); });
+        this.container.on('accepted', async (context) => {
+            let delivery = context.delivery;
+            if (delivery.__on_update) {
+                delivery.__on_update(delivery, STATE_ACCEPTED);
+            }
+        });
+        this.container.on('rejected', async (context) => {
+            let delivery = context.delivery;
+            if (delivery.__on_update) {
+                delivery.__on_update(delivery, STATE_REJECTED);
+            }
+        });
+        this.container.on('released', async (context) => {
+            let delivery = context.delivery;
+            if (delivery.__on_update) {
+                delivery.__on_update(delivery, STATE_RELEASED);
+            }
+        });
+        this.container.on('modified', async (context) => {
+            let delivery = context.delivery;
+            if (delivery.__on_update) {
+                delivery.__on_update(delivery, STATE_MODIFIED);
+            }
+        });
+        this.container.on('settled', async (context) => {
+            let delivery = context.delivery;
+            if (delivery.__on_update) {
+                delivery.__on_update(delivery);
+            }
+        });
     }
 }
 
@@ -166,6 +196,13 @@ export class FetchResult {
     }
 }
 
+class OutgoingMessage {
+    constructor(message, on_update) {
+        this.message   = message;
+        this.on_update = on_update;
+    }
+}
+
 export class ClientEndpoint {
     constructor(connection, address) {
         this.connection = connection;
@@ -178,19 +215,23 @@ export class ClientEndpoint {
         this.sender.__endpoint = this;
     }
 
+    //
+    // Perform a REST-style operation on a resource.
+    //
     fetch(path, args={}) {
         return new Promise((resolve, reject) => {
             let config = {
                 op      : 'GET',
-                timeout : DEFAULT_TIMEOUT_SECONDS,
+                timeout : DEFAULT_TIMEOUT_MSEC,
             }
             for (const [key, val] of Object.entries(args)) {
                 config[key] = val;
             }
 
             const timer = setTimeout(() => {
+                delete this.in_flight[cid];
                 reject(new Error('Operation timed out without a response from the server'));
-            }, config.timeout * 1000);
+            }, config.timeout);
 
             const cid = this.connection._new_cid(this);
             this.in_flight[cid] = (context) => {
@@ -205,13 +246,83 @@ export class ClientEndpoint {
                 },
                 body : config.body,
             };
-            this.outgoing.push(request);
-            this._on_sendable()
+            this.outgoing.push(new OutgoingMessage(request));
+            this._on_sendable();
         });
     }
 
-    async acquire(path, args={}) {
+    //
+    // Start a watch for unsolicited updates on the state of a resource.
+    //
+    watch(path, args={}) {}
 
+    //
+    // Run a critical section with an acquired mutex.
+    //   path => The API path of the mutex to be acquired
+    //   inner => The critical section function (must be an async function)
+    //   on_cancel => handler called if the mutex is dropped by the server
+    //                This must stop the execution of the 'inner' function
+    //   args:
+    //     timeout => time in mSec to wait for acquisition, 0 == wait forever
+    //     label   => label to describe this critical section - can be used by the server
+    //
+    critical_section(path, mutex_name, inner, on_cancel, args={}) {
+        return new Promise((resolve, reject) => {
+            let config = { timeout : DEFAULT_TIMEOUT_MSEC };
+            for (const [k,v] of Object.entries(args)) {
+                config[k] = v;
+            }
+
+            var timer;
+            if (config.timeout > 0) {
+                timer = setTimeout(() => {
+                    reject(new Error('Operation timed out without a response from the server'));
+                }, config.timeout);
+            }
+
+            const cid = this.connection._new_cid(this);
+            var   request_delivery;
+            var   inner_completed = false;
+            this.in_flight[cid] = async (context) => {
+                if (timer) {
+                    clearTimeout(timer);
+                }
+                const ap = context.message.application_properties;
+                if (ap.status != 200) {
+                    reject(new Error(`Mutex error: (${ap.status}) ${ap.status_description}`));
+                } else {
+                    const rval = await inner(ap.acquisition_id);
+                    inner_completed = true;
+                    if (request_delivery) {
+                        request_delivery.update(true);
+                    }
+                    resolve(rval);
+                }
+            };
+            let request = {
+                correlation_id : cid,
+                application_properties : {
+                    op         : 'acquire',
+                    path       : path,
+                    mutex_name : mutex_name,
+                },
+                body : config.body,
+            };
+            this.outgoing.push(new OutgoingMessage(request, (delivery, state) => {
+                if (state == STATE_ACCEPTED) {
+                    request_delivery = delivery;
+                    if (inner_completed) {
+                        delivery.settled = true;
+                    }
+                }
+                if (delivery.remote_settled && !delivery.settled) {
+                    delivery.settled = true;
+                    on_cancel();
+                    reject(new Error('Mutex was dropped prematurely'));
+                }
+            }));
+            this._on_sendable();
+        });
     }
 
     async _dispatch(context) {
@@ -230,9 +341,10 @@ export class ClientEndpoint {
         }
 
         while (this.sender.credit > 0 && this.outgoing.length > 0) {
-            const message = this.outgoing.pop();
-            message.reply_to = this.connection.reply_to;
-            this.sender.send(message);
+            const outgoing = this.outgoing.shift();
+            outgoing.message.reply_to = this.connection.reply_to;
+            let delivery = this.sender.send(outgoing.message);
+            delivery.__on_update = outgoing.on_update;
         }
     }
 }
@@ -263,7 +375,7 @@ export class ServerEndpoint {
             return tree;
         }
 
-        const first = elements.pop();
+        const first = elements.shift();
         if (first == '') {
             // Ignore blank elements
             return this._find_path(tree, elements);
@@ -278,9 +390,10 @@ export class ServerEndpoint {
         if (pathtext) {
             const elements = pathtext.split('/');
             const path     = this._find_path(this.path_tree, elements);
+            const node     = path ? path.get_node() : undefined;
 
-            if (path) {
-                await path.get_node()._dispatch(context);
+            if (node) {
+                await node._dispatch(context);
                 return;
             }
         }
@@ -289,8 +402,8 @@ export class ServerEndpoint {
             to             : context.message.reply_to,
             correlation_id : context.message.correlation_id,
             application_properties : {
-                status            : '404',
-                statusDescription : 'Not Found',
+                status             : 404,
+                status_description : 'Not Found',
             },
             body : "No resource found at path",
         };
@@ -348,7 +461,7 @@ class Path {
             // End of the line, insert here
             this.node = node;
         } else {
-            let element = elements.pop();
+            let element = elements.shift();
             if (element == '') {
                 // Ignore blank elements
                 this.insert(node, elements);
@@ -407,7 +520,7 @@ export class Node {
 
     mutex() {
         if (!this._mutex) {
-            this._mutex = new Mutex(this);
+            this._mutex = new Mutex(this.endpoint);
         }
         return this._mutex;
     }
@@ -417,33 +530,33 @@ export class Node {
         const opcode = context.message.application_properties.op.toLowerCase();
 
         if (opcode == 'acquire') {
-            await this.mutex._dispatch(context);
+            await this._mutex._dispatch(context);
             handled = true;
         } else {
             for (const handler of this.handlers[opcode]) {
                 handler(context.message, new Response(context.message, this.endpoint.connection.anonSender)); // Use the 'next' argument
                 handled = true;
             }
+
+            context.delivery.accept();
+            context.delivery.settled = true;
         }
 
         if (!handled) {
             const response = {
                 to                     : context.message.reply_to,
                 correlation_id         : context.message.correlation_id,
-                application_properties : { status: 400, statusDescription: 'Not Permitted' },
+                application_properties : { status: 400, status_description: 'Not Permitted' },
                 body                   : 'Method not permitted for this resource',
             };
             this.endpoint.connection.anonSender.send(response);
         }
-
-        context.delivery.accept();
-        context.delivery.settled = true;
     }
 }
 
 export class Mutex {
-    constructor(path) {
-        this.path      = path;
+    constructor(endpoint) {
+        this.endpoint  = endpoint;
         this.instances = {}; // name => Named mutex instance
     }
 
@@ -462,19 +575,20 @@ export class Mutex {
         return undefined;
     }
 
-    async _dispatch(delivery, message) {
-        const ap = message.application_properties;
-        const mutexName = ap.name;
+    async _dispatch(context) {
+        const ap = context.message.application_properties;
+        const mutexName = ap.mutex_name;
         if (!this.instances[mutexName]) {
-            this.instances[mutexName] = new MutexInstance();
+            this.instances[mutexName] = new MutexInstance(this.endpoint);
         }
-        await this.instances[mutexName]._dispatch(delivery, message);
+        await this.instances[mutexName]._dispatch(context);
     }
 }
 
 class MutexInstance {
-    constructor() {
-        this.queue = []; // {delivery, message}
+    constructor(endpoint) {
+        this.endpoint = endpoint;
+        this.queue    = []; // {delivery, message}
     }
 
     //
@@ -488,25 +602,54 @@ class MutexInstance {
         return list;
     }
 
-    async _dispatch(delivery, message) {
-        const ap = message.application_properties;
+    async grant_lock() {
+        const request = this.queue[0];
+        request.delivery.__on_update = async (delivery, state) => {
+            if (delivery.remote_settled && !delivery.settled) {
+                // Mutex has been released by the client
+                delivery.update(true);
+                this.queue.shift();
+                if (this.queue.length > 0) {
+                    await this.grant_lock();
+                }
+            }
+        };
+        request.delivery.accept();
+        this._send_response(request.message);
+    }
+
+    async _dispatch(context) {
+        const ap = context.message.application_properties;
         let request = {
-            delivery : delivery,
-            message  : message,
+            delivery : context.delivery,
+            message  : context.message,
             timer    : (this.queue.length > 0 && ap.wait_time) ? setTimeout(() => {
-                delivery.reject();
-                delivery.settle();
-                this._remove_head();  // doesn't look right
+                // TODO
             }, ap.wait_time) : undefined,
         }
         this.queue.push(request);
         if (this.queue.length == 1) {
-            delivery.accept(); // Acquire the lock
+            await this.grant_lock();
         }
     }
 
+    _send_response(message, status=200, description='Ok', body=undefined) {
+        let resp = {
+            to             : message.reply_to,
+            correlation_id : message.correlation_id,
+            application_properties : {
+                status             : status,
+                status_description : description,
+                acquisition_id     : 'abcde',      // TODO - fix this
+            },
+            body : body,
+        }
+
+        this.endpoint.connection.anonSender.send(resp);
+    }
+
     _remove_head() {
-        this.queue.pop();
+        this.queue.shift();
         if (this.queue.length > 0) {
             let head = this.queue[0];
             if (head.timer) {
