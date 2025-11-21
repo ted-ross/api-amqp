@@ -28,6 +28,9 @@ const STATE_REJECTED = 2;
 const STATE_RELEASED = 3;
 const STATE_MODIFIED = 4;
 
+const LINK_CLASS_FETCH = 'f';
+const LINK_CLASS_MUTEX = 'm';
+
 export class APIConnection {
     constructor(host='localhost', port='5672', transport='tcp', ca=undefined, cert=undefined, key=undefined) {
         //
@@ -76,7 +79,8 @@ export class APIConnection {
     //
     // Server Side - Establish an endpoint for receiving API requests
     //
-    server_endpoint(address) {
+    server_endpoint(_address) {
+        const address = _address[0] == '/' ? _address : '/' + _address;
         if (!this.server_endpoints[address]) {
             let e = new ServerEndpoint(this, address);
             this.server_endpoints[address] = e;
@@ -90,7 +94,8 @@ export class APIConnection {
     // Client Side - Establish a portal to a server endpoint.  This will use an addressed sender link
     // and will provide flow control back pressure to the application.
     //
-    client_endpoint(address) {
+    client_endpoint(_address) {
+        const address = _address[0] == '/' ? _address : '/' + _address;
         if (!this.client_endpoints[address]) {
             let e = new ClientEndpoint(this, address);
             this.client_endpoints[address] = e;
@@ -117,14 +122,14 @@ export class APIConnection {
             if (context.receiver == this.replyReceiver) {
                 this.reply_to = context.receiver.source.address;
                 for (const client of Object.values(this.client_endpoints)) {
-                    client._on_sendable();
+                    client._on_reply_addr_ready();
                 }
                 //console.log(`reply-to: ${this.reply_to}`);
             }
         });
         this.container.on('sendable', async (context) => {
             if (context.sender.__endpoint) {
-                context.sender.__endpoint._on_sendable();
+                context.sender.__endpoint._on_sendable(context.sender);
             }
         });
         this.container.on('message', async (context) => {
@@ -205,14 +210,30 @@ class OutgoingMessage {
 
 export class ClientEndpoint {
     constructor(connection, address) {
-        this.connection = connection;
-        this.address    = address;
-        this.outgoing   = [];
-        this.in_flight  = {};
-        this.sender     = connection.amqpConnection.open_sender({
-            target : address,
-        });
-        this.sender.__endpoint = this;
+        this.connection   = connection;
+        this.address      = address;
+        this.in_flight    = {};
+        this.sessions     = {
+            [LINK_CLASS_FETCH] : connection.amqpConnection.create_session(),
+            [LINK_CLASS_MUTEX] : connection.amqpConnection.create_session(),
+        }
+        this.senders      = {
+            [LINK_CLASS_FETCH] : this.sessions[LINK_CLASS_FETCH].open_sender({ target : `${LINK_CLASS_FETCH}${address}` }),
+            [LINK_CLASS_MUTEX] : this.sessions[LINK_CLASS_MUTEX].open_sender({ target : `${LINK_CLASS_MUTEX}${address}` }),
+        };
+        this.outgoing     = {
+            [LINK_CLASS_FETCH] : [],
+            [LINK_CLASS_MUTEX] : [],
+        };
+
+        for (let [lcls, sender] of Object.entries(this.senders)) {
+            sender.__link_class = lcls;
+            sender.__endpoint   = this;
+        }
+
+        for (const session of Object.values(this.sessions)) {
+            session.begin();
+        }
     }
 
     //
@@ -246,8 +267,8 @@ export class ClientEndpoint {
                 },
                 body : config.body,
             };
-            this.outgoing.push(new OutgoingMessage(request));
-            this._on_sendable();
+            this.outgoing[LINK_CLASS_FETCH].push(new OutgoingMessage(request));
+            this._on_sendable(this.senders[LINK_CLASS_FETCH]);
         });
     }
 
@@ -273,7 +294,7 @@ export class ClientEndpoint {
                 config[k] = v;
             }
 
-            var timer;
+            let timer;
             if (config.timeout > 0) {
                 timer = setTimeout(() => {
                     reject(new Error('Operation timed out without a response from the server'));
@@ -281,8 +302,8 @@ export class ClientEndpoint {
             }
 
             const cid = this.connection._new_cid(this);
-            var   request_delivery;
-            var   inner_completed = false;
+            let   request_delivery;
+            let   inner_completed = false;
             this.in_flight[cid] = async (context) => {
                 if (timer) {
                     clearTimeout(timer);
@@ -308,7 +329,7 @@ export class ClientEndpoint {
                 },
                 body : config.body,
             };
-            this.outgoing.push(new OutgoingMessage(request, (delivery, state) => {
+            this.outgoing[LINK_CLASS_MUTEX].push(new OutgoingMessage(request, (delivery, state) => {
                 if (state == STATE_ACCEPTED) {
                     request_delivery = delivery;
                     if (inner_completed) {
@@ -321,7 +342,7 @@ export class ClientEndpoint {
                     reject(new Error('Mutex was dropped prematurely'));
                 }
             }));
-            this._on_sendable();
+            this._on_sendable(this.senders[LINK_CLASS_MUTEX]);
         });
     }
 
@@ -335,15 +356,22 @@ export class ClientEndpoint {
         }
     }
 
-    _on_sendable() {
-        if (!this.connection.reply_to) {
+    _on_reply_addr_ready() {
+        for (const sender of Object.values(this.senders)) {
+            this._on_sendable(sender);
+        }
+    }
+
+    _on_sendable(sender) {
+        const link_class = sender.__link_class;
+        if (!this.connection.reply_to || link_class == undefined) {
             return;
         }
 
-        while (this.sender.credit > 0 && this.outgoing.length > 0) {
-            const outgoing = this.outgoing.shift();
+        while (sender.credit > 0 && this.outgoing[link_class].length > 0) {
+            const outgoing = this.outgoing[link_class].shift();
             outgoing.message.reply_to = this.connection.reply_to;
-            let delivery = this.sender.send(outgoing.message);
+            let delivery = sender.send(outgoing.message);
             delivery.__on_update = outgoing.on_update;
         }
     }
@@ -354,13 +382,31 @@ export class ServerEndpoint {
         this.connection = connection;
         this.address    = address;
         this.path_tree  = new Path();
-        this.receiver = this.connection.amqpConnection.open_receiver({
-            source: address,
-            autoaccept: false,  // We will explicitly handle delivery disposition
-            autosettle: false,  // We will explicitly handle delivery settlement
-            rcv_settle_mode: 1, // Don't automatically settle when terminal disposition is set on a delivery
-        });
-        this.receiver.__endpoint = this;
+        this.sessions     = {
+            [LINK_CLASS_FETCH] : this.connection.amqpConnection.create_session(),
+            [LINK_CLASS_MUTEX] : this.connection.amqpConnection.create_session(),
+        }
+        this.receivers  = {
+            [LINK_CLASS_FETCH] : this.sessions[LINK_CLASS_FETCH].open_receiver({
+                source: `${LINK_CLASS_FETCH}${address}`,
+                autoaccept: false,  // We will explicitly handle delivery disposition
+                autosettle: false,  // We will explicitly handle delivery settlement
+                rcv_settle_mode: 1, // Don't automatically settle when terminal disposition is set on a delivery
+            }),
+            [LINK_CLASS_MUTEX] : this.sessions[LINK_CLASS_MUTEX].open_receiver({
+                source: `${LINK_CLASS_MUTEX}${address}`,
+                autoaccept: false,  // We will explicitly handle delivery disposition
+                autosettle: false,  // We will explicitly handle delivery settlement
+                rcv_settle_mode: 1, // Don't automatically settle when terminal disposition is set on a delivery
+            }),
+        }
+        for (let receiver of Object.values(this.receivers)) {
+            receiver.__endpoint = this;
+        }
+
+        for (const session of Object.values(this.sessions)) {
+            session.begin();
+        }
     }
 
     route(path) {

@@ -48,7 +48,7 @@ async function TestServer() {
 
 async function TestClient() {
     const client_connection = new APIConnection();
-    const endpoint = client_connection.client_endpoint('/test_endpoint/v1alpha1')
+    const endpoint = client_connection.client_endpoint('test_endpoint/v1alpha1')
     let result = await endpoint.fetch('/names', {timeout: 1000});
     console.log(`Status: ${result.status()}, Body: `, result.obj());
 
@@ -96,7 +96,7 @@ async function LockTest() {
     const endpoint = client_connection.client_endpoint('/lock_test/v1alpha1');
     let workers  = [];
     let promises = [];
-    const count = 250;
+    const count = 1000;
     for (let i = 0; i < count; i++) {
         workers.push(new CountClient(endpoint));
     }
@@ -115,11 +115,10 @@ async function LockTest() {
     const result = await endpoint.fetch('/variables/counter');
     const final = result.obj();
     console.log(`Final count: ${final} - ${(final != count) ? `FAIL (expected ${count})` : 'PASS'}`);
-    console.log(values);
 }
 
 await TestServer();
 await TestClient();
 await LockTest();
 
-setTimeout(() => { process.exit(0)}, 10000);
+setTimeout(() => { process.exit(0)}, 0);
