@@ -44,6 +44,7 @@ async function TestServer() {
         res.status(200).send(counter);
     });
     let mutex = lock_test_endpoint.route('/locks').mutex();
+    return server_connection;
 }
 
 async function TestClient() {
@@ -60,6 +61,7 @@ async function TestClient() {
 
     result = await endpoint.fetch('/names/sub1/sub2', {op: 'PUT', timeout: 2000, body: 'Another Sub2'});
     console.log(`Status: ${result.status()}, Body: `, result.obj());
+    return client_connection;
 }
 
 class CountClient {
@@ -115,10 +117,13 @@ async function LockTest() {
     const result = await endpoint.fetch('/variables/counter');
     const final = result.obj();
     console.log(`Final count: ${final} - ${(final != count) ? `FAIL (expected ${count})` : 'PASS'}`);
+    return client_connection;
 }
 
-await TestServer();
-await TestClient();
-await LockTest();
+const conn1 = await TestServer();
+const conn2 = await TestClient();
+const conn3 = await LockTest();
 
-setTimeout(() => { process.exit(0)}, 0);
+conn3.close();
+conn2.close();
+conn1.close();
