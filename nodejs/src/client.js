@@ -52,8 +52,8 @@ export class ClientEndpoint {
             [LINK_CLASS_MUTEX] : connection.amqpConnection.create_session(),
         }
         this.senders      = {
-            [LINK_CLASS_FETCH] : this.sessions[LINK_CLASS_FETCH].open_sender({ target : `${LINK_CLASS_FETCH}${address}` }),
-            [LINK_CLASS_MUTEX] : this.sessions[LINK_CLASS_MUTEX].open_sender({ target : `${LINK_CLASS_MUTEX}${address}` }),
+            [LINK_CLASS_FETCH] : this.sessions[LINK_CLASS_FETCH].open_sender({ target : `${address}/${LINK_CLASS_FETCH}` }),
+            [LINK_CLASS_MUTEX] : this.sessions[LINK_CLASS_MUTEX].open_sender({ target : `${address}/${LINK_CLASS_MUTEX}` }),
         };
         this.outgoing     = {
             [LINK_CLASS_FETCH] : [],
@@ -267,4 +267,3 @@ export class ClientEndpoint {
         }
     }
 }
-

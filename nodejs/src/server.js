@@ -32,13 +32,13 @@ export class ServerEndpoint {
         }
         this.receivers  = {
             [LINK_CLASS_FETCH] : this.sessions[LINK_CLASS_FETCH].open_receiver({
-                source: `${LINK_CLASS_FETCH}${address}`,
+                source: `${address}/${LINK_CLASS_FETCH}`,
                 autoaccept: false,  // We will explicitly handle delivery disposition
                 autosettle: false,  // We will explicitly handle delivery settlement
                 rcv_settle_mode: 1, // Don't automatically settle when terminal disposition is set on a delivery
             }),
             [LINK_CLASS_MUTEX] : this.sessions[LINK_CLASS_MUTEX].open_receiver({
-                source: `${LINK_CLASS_MUTEX}${address}`,
+                source: `${address}/${LINK_CLASS_MUTEX}`,
                 autoaccept: false,  // We will explicitly handle delivery disposition
                 autosettle: false,  // We will explicitly handle delivery settlement
                 rcv_settle_mode: 1, // Don't automatically settle when terminal disposition is set on a delivery

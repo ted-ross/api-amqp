@@ -28,4 +28,3 @@ export const STATE_MODIFIED = 4;
 
 export const LINK_CLASS_FETCH = 'f';
 export const LINK_CLASS_MUTEX = 'm';
-
