@@ -116,13 +116,24 @@ async function LockTest() {
     const values = await Promise.all(promises);
     const result = await endpoint.fetch('/variables/counter');
     const final = result.obj();
-    console.log(`Final count: ${final} - ${(final != count) ? `FAIL (expected ${count})` : 'PASS'}`);
+    console.log(`LockTest: ${(final != count) ? `FAIL (expected ${count}, got ${final})` : 'PASS'}`);
     return client_connection;
+}
+
+function check_cleanup(conn, label) {
+    const stats = conn.get_stats();
+    if (stats.in_flight_count > 0) {
+        console.log(`Connection cleanup error [${label}]: in_flight requests remain: ${stats.in_flight_count}`);
+    }
 }
 
 const conn1 = await TestServer();
 const conn2 = await TestClient();
 const conn3 = await LockTest();
+
+check_cleanup(conn1, "Server");
+check_cleanup(conn2, "Client");
+check_cleanup(conn3, "LockTest");
 
 conn3.close();
 conn2.close();

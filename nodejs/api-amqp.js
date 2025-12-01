@@ -32,7 +32,7 @@ const LINK_CLASS_FETCH = 'f';
 const LINK_CLASS_MUTEX = 'm';
 
 export class APIConnection {
-    constructor(host='localhost', port='5672', transport='tcp', ca=undefined, cert=undefined, key=undefined) {
+    constructor(options) {
         //
         // Create an AMQP container dedicated to this API connection
         //
@@ -51,15 +51,7 @@ export class APIConnection {
         //
         // Open the AMQP connection to the network
         //
-        this.amqpConnection = this.container.connect({
-            host      : host,
-            hostname  : host,
-            transport : transport,
-            port      : port,
-            ca        : ca,
-            key       : key,
-            cert      : cert,
-        });
+        this.amqpConnection = this.container.connect(options);
 
         //
         // Set up a receiver with a dynamic address on which to receive replies
@@ -74,6 +66,14 @@ export class APIConnection {
 
     close() {
         this.amqpConnection.close();
+    }
+
+    get_stats() {
+        return {
+            server_endpoint_count : Object.keys(this.server_endpoints).length,
+            client_endpoint_count : Object.keys(this.client_endpoints).length,
+            in_flight_count       : Object.keys(this.in_flight).length,
+        };
     }
 
     //
@@ -237,10 +237,13 @@ export class ClientEndpoint {
     }
 
     //
-    // Perform a REST-style operation on a resource.
+    // Perform a REST/CRUD-style operation on a resource.
     //
     fetch(path, args={}) {
         return new Promise((resolve, reject) => {
+            //
+            // Establish the default options and override them with the arguments supplied.
+            //
             let config = {
                 op      : 'GET',
                 timeout : DEFAULT_TIMEOUT_MSEC,
@@ -249,16 +252,28 @@ export class ClientEndpoint {
                 config[key] = val;
             }
 
+            //
+            // Set up a timer to handle the timeout failure.
+            //
             const timer = setTimeout(() => {
                 delete this.in_flight[cid];
+                this.connection._cancel_cid(cid);
                 reject(new Error('Operation timed out without a response from the server'));
             }, config.timeout);
 
+            //
+            // Get a unique correlation-id for this request and record the response-handler for this request.
+            //
             const cid = this.connection._new_cid(this);
             this.in_flight[cid] = (context) => {
                 clearTimeout(timer);
+                delete this.in_flight[cid];
                 resolve(new FetchResult(context.message));
             };
+
+            //
+            // Compose the request message for this operation.
+            //
             let request = {
                 correlation_id : cid,
                 application_properties : {
@@ -267,6 +282,11 @@ export class ClientEndpoint {
                 },
                 body : config.body,
             };
+
+            //
+            // Enqueue the request for this link class and poke the sending process to flush it
+            // out in case it is possible to send now.
+            //
             this.outgoing[LINK_CLASS_FETCH].push(new OutgoingMessage(request));
             this._on_sendable(this.senders[LINK_CLASS_FETCH]);
         });
@@ -289,18 +309,29 @@ export class ClientEndpoint {
     //
     critical_section(path, mutex_name, inner, on_cancel, args={}) {
         return new Promise((resolve, reject) => {
+            //
+            // Establish default options and overwrite with the supplied arguments
+            //
             let config = { timeout : DEFAULT_TIMEOUT_MSEC };
             for (const [k,v] of Object.entries(args)) {
                 config[k] = v;
             }
 
+            //
+            // If a timeout is specified, set a timer to handle the timeout error.
+            //
             let timer;
             if (config.timeout > 0) {
                 timer = setTimeout(() => {
-                    reject(new Error('Operation timed out without a response from the server'));
+                    delete this.in_flight[cid];
+                    this.connection._cancel_cid(cid);
+                    reject(new Error('Timed out waiting for the mutex.  Critical section did not run.'));
                 }, config.timeout);
             }
 
+            //
+            // Get a unique correlation-id and register a response handler.
+            //
             const cid = this.connection._new_cid(this);
             let   request_delivery;
             let   inner_completed = false;
@@ -309,17 +340,25 @@ export class ClientEndpoint {
                     clearTimeout(timer);
                 }
                 const ap = context.message.application_properties;
-                if (ap.status != 200) {
-                    reject(new Error(`Mutex error: (${ap.status}) ${ap.status_description}`));
-                } else {
+                if (ap.status == 200) {
                     const rval = await inner(ap.acquisition_id);
                     inner_completed = true;
+
+                    //
+                    // Settle the delivery for the request message, signaling the release of the mutex.
+                    //
                     if (request_delivery) {
                         request_delivery.update(true);
                     }
                     resolve(rval);
+                } else {
+                    reject(new Error(`Mutex error: (${ap.status}) ${ap.status_description}`));
                 }
             };
+
+            //
+            // Compose the request message.
+            //
             let request = {
                 correlation_id : cid,
                 application_properties : {
@@ -329,19 +368,35 @@ export class ClientEndpoint {
                 },
                 body : config.body,
             };
+
+            //
+            // Enqueue the request along with a disposition-update handler to track changes to the request delivery.
+            //
             this.outgoing[LINK_CLASS_MUTEX].push(new OutgoingMessage(request, (delivery, state) => {
                 if (state == STATE_ACCEPTED) {
+                    //
+                    // The request has been accepted.  This means it will be processed by the server.
+                    // Store the delivery so we can change its disposition later.
+                    //
                     request_delivery = delivery;
                     if (inner_completed) {
                         delivery.settled = true;
                     }
                 }
                 if (delivery.remote_settled && !delivery.settled) {
+                    //
+                    // The server (or network) settled the delivery before we did.  This means that the
+                    // mutex has been effectively dropped without our input.  Call the on_cancel handler.
+                    //
                     delivery.settled = true;
                     on_cancel();
                     reject(new Error('Mutex was dropped prematurely'));
                 }
             }));
+
+            //
+            // Kick the delivery-send process.
+            //
             this._on_sendable(this.senders[LINK_CLASS_MUTEX]);
         });
     }
@@ -368,8 +423,10 @@ export class ClientEndpoint {
             return;
         }
 
-        while (sender.credit > 0 && this.outgoing[link_class].length > 0) {
+        let credit = sender.credit;
+        while (credit > 0 && this.outgoing[link_class].length > 0) {
             const outgoing = this.outgoing[link_class].shift();
+            credit -= 1;
             outgoing.message.reply_to = this.connection.reply_to;
             let delivery = sender.send(outgoing.message);
             delivery.__on_update = outgoing.on_update;
@@ -706,6 +763,5 @@ class MutexInstance {
     }
 
     async _release(delivery) {
-        
     }
 }
