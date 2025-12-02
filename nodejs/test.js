@@ -51,16 +51,16 @@ async function TestClient() {
     const client_connection = new APIConnection();
     const endpoint = client_connection.client_endpoint('test_endpoint/v1alpha1')
     let result = await endpoint.fetch('/names', {timeout: 1000});
-    console.log(`Status: ${result.status()}, Body: `, result.obj());
+    console.log(`Status: ${result.status()}, Body: `, await result.data());
 
     result = await endpoint.fetch('/names/sub1/sub2');
-    console.log(`Status: ${result.status()}, Body: `, result.obj());
+    console.log(`Status: ${result.status()}, Body: `, await result.data());
 
     result = await endpoint.fetch('/names/sub1', {timeout: 2000});
-    console.log(`Status: ${result.status()}, Body: `, result.obj());
+    console.log(`Status: ${result.status()}, Body: `, await result.data());
 
     result = await endpoint.fetch('/names/sub1/sub2', {op: 'PUT', timeout: 2000, body: 'Another Sub2'});
-    console.log(`Status: ${result.status()}, Body: `, result.obj());
+    console.log(`Status: ${result.status()}, Body: `, await result.data());
     return client_connection;
 }
 
@@ -71,7 +71,7 @@ class CountClient {
 
     async increment() {
         let result = await this.endpoint.fetch('/variables/counter');
-        let value = result.obj();
+        let value  = await result.data();
         value += 1;
         result = await this.endpoint.fetch('/variables/counter', {op: 'PUT', body: value});
         return value;
@@ -79,15 +79,17 @@ class CountClient {
 
     async safe_increment() {
         return await this.endpoint.critical_section(
-            '/locks',
-            'counter',
-            async (acquisition_id) => {
+            '/locks',   // Path to the mutex set
+            'counter',  // Mutex instance name
+            async (acquisition_id) => {   // Critical section function
                 return await this.increment();
             },
-            () => {},
+            () => {   // on_cancel function
+                console.log('Unexpected mutex abort');
+            },
             {
-                label      : 'safe_increment',
-                timeout    : 10000,
+                label   : 'safe_increment',
+                timeout : 10000,
             }
         );
     }
@@ -115,7 +117,7 @@ async function LockTest() {
     //
     const values = await Promise.all(promises);
     const result = await endpoint.fetch('/variables/counter');
-    const final = result.obj();
+    const final  = await result.data();
     console.log(`LockTest: ${(final != count) ? `FAIL (expected ${count}, got ${final})` : 'PASS'}`);
     return client_connection;
 }

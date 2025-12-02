@@ -30,7 +30,7 @@ export class FetchResult {
         return this.message.application_properties.status;
     }
 
-    obj() {
+    async data() {
         return this.message.body;
     }
 }
@@ -87,16 +87,7 @@ export class ClientEndpoint {
             }
 
             //
-            // Set up a timer to handle the timeout failure.
-            //
-            const timer = setTimeout(() => {
-                delete this.in_flight[cid];
-                this.connection._cancel_cid(cid);
-                reject(new Error('Operation timed out without a response from the server'));
-            }, config.timeout);
-
-            //
-            // Get a unique correlation-id for this request and record the response-handler for this request.
+            // Get a unique correlation-id for this request and store the response-handler for this request.
             //
             const cid = this.connection._new_cid(this);
             this.in_flight[cid] = (context) => {
@@ -104,6 +95,15 @@ export class ClientEndpoint {
                 delete this.in_flight[cid];
                 resolve(new FetchResult(context.message));
             };
+
+            //
+            // Set up a timer to handle the timeout failure.
+            //
+            const timer = setTimeout(() => {
+                delete this.in_flight[cid];
+                this.connection._cancel_cid(cid);
+                reject(new Error('Operation timed out without a response from the server'));
+            }, config.timeout);
 
             //
             // Compose the request message for this operation.
@@ -133,7 +133,8 @@ export class ClientEndpoint {
 
     //
     // Run a critical section with an acquired mutex.
-    //   path => The API path of the mutex to be acquired
+    //   path => The API path of the mutex-set
+    //   mutex_name => The name of the mutex in the set to be acquired
     //   inner => The critical section function (must be an async function)
     //   on_cancel => handler called if the mutex is dropped by the server
     //                This must stop the execution of the 'inner' function
@@ -175,6 +176,9 @@ export class ClientEndpoint {
                 }
                 const ap = context.message.application_properties;
                 if (ap.status == 200) {
+                    //
+                    // Acquired the mutex, call the critical section function.
+                    //
                     const rval = await inner(ap.acquisition_id);
                     inner_completed = true;
 
